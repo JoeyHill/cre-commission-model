@@ -71,8 +71,7 @@ def pay_at(
         "commission": commission,
         "initial_commission": initial_commission,
         "post_commission": post_commission,
-        "effective_rate": effective_rate,
-        "tier": tier,
+        "effective_rate": effective_rate
     }
 
 
@@ -94,6 +93,16 @@ def sample_gross(ceiling: float, required: list[float]) -> list[float]:
     return sorted(set(values))
 
 
+def broker_pay(
+    gross: float,
+    broker_rate: float,
+    minimum_gross_sales: float,
+    commission: float,
+) -> float:
+    """Broker's share of gross, after the minimum-gross expense and commission."""
+    return gross * (broker_rate / 100.0) - minimum_gross_sales - commission
+
+
 def money(amount: float) -> str:
     """Format dollars for Streamlit markdown, which treats $ as LaTeX."""
     return f"\\${amount:,.0f}"
@@ -107,10 +116,10 @@ def build_chart(
     target_compensation: float,
     minimum_gross_sales: float,
 ) -> alt.LayerChart:
-    """Dual-axis chart: gross on x, compensation on the left, effective rate on the right."""
+    """Gross on x. Pay on the left covers total compensation and broker pay. Effective rate is on the right."""
     series_scale = alt.Scale(
-        domain=["Total compensation", "Effective commission rate"],
-        range=["#4C78A8", "#E45756"],
+        domain=["Total compensation", "Broker pay", "Effective commission rate"],
+        range=["#4C78A8", "#F58518", "#E45756"],
     )
     x_encoding = alt.X(
         "gross:Q",
@@ -121,23 +130,35 @@ def build_chart(
     tooltips = [
         alt.Tooltip("gross:Q", title="Gross sales", format="$,.0f"),
         alt.Tooltip("total_compensation:Q", title="Total compensation", format="$,.0f"),
+        alt.Tooltip("broker_pay:Q", title="Broker pay", format="$,.0f"),
         alt.Tooltip("commission:Q", title="Commission", format="$,.0f"),
-        alt.Tooltip("effective_rate:Q", title="Effective commission rate", format=".2f"),
-        alt.Tooltip("tier:N", title="Tier"),
+        alt.Tooltip("effective_rate:Q", title="Effective commission rate", format=".2f")
     ]
     legend = alt.Legend(title=None, orient="top", direction="horizontal")
 
-    compensation = (
+    dollar_amounts = curve.loc[
+        curve["series"].isin(["Total compensation", "Broker pay"]), "amount"
+    ].astype(float)
+    low = float(dollar_amounts.min())
+    high = float(dollar_amounts.max())
+    pad = max(high - min(low, 0.0), 1.0) * 0.05
+    # dollar_domain = [min(low, 0.0) - (pad if low < 0 else 0.0), high + pad]
+    dollar_domain = [0, 200000]
+    pay = (
         alt.Chart(curve)
-        .transform_filter(alt.datum.series == "Total compensation")
+        .transform_filter(
+            alt.FieldOneOfPredicate(
+                field="series", oneOf=["Total compensation", "Broker pay"]
+            )
+        )
         .mark_line(strokeWidth=2.5)
         .encode(
             x=x_encoding,
             y=alt.Y(
-                "total_compensation:Q",
-                title="Total compensation ($)",
-                scale=alt.Scale(zero=True, domain=[0, 200000]),
-                axis=alt.Axis(format="$,.3s", titleColor="#4C78A8"),
+                "amount:Q",
+                title="Pay ($)",
+                scale=alt.Scale(domain=dollar_domain),
+                axis=alt.Axis(format="$,.3s"),
             ),
             color=alt.Color("series:N", scale=series_scale, legend=legend),
             tooltip=tooltips,
@@ -228,22 +249,19 @@ def build_chart(
             )
         )
 
-    layers.extend([compensation, rate])
+    layers.extend([pay, rate])
     return (
         alt.layer(*layers)
         .resolve_scale(y="independent")
         .properties(
             height=460,
-            title="Total compensation and effective commission rate by gross sales",
+            title="Total compensation, broker pay, and effective commission rate by gross sales",
         )
     )
 
 
 st.title("Commission model")
-st.caption(
-    "Commission is 0% through the minimum gross. Gross above that earns the initial rate "
-    "until target compensation is reached, then the post-target rate."
-)
+
 
 with st.sidebar:
     st.title("Configuration")
@@ -279,11 +297,19 @@ with st.sidebar:
         step=10_000,
         help="Gross sales earn no commission until this amount. The rate applies only above it.",
     )
+    broker_commission = st.number_input(
+        "Broker commission (%)",
+        min_value=0.0,
+        max_value=100.0,
+        value=60.0,
+        step=1.0,
+        help="Percent of gross paid to the broker.",
+    )
     commission_rate = st.slider(
         "Commission rate (%)",
         min_value=0.0,
         max_value=5.0,
-        value=1.5,
+        value=2.5,
         step=0.1,
         help="Percent of gross above the minimum until target compensation is reached.",
     )
@@ -291,7 +317,7 @@ with st.sidebar:
         "Post-target commission (%)",
         min_value=0.0,
         max_value=5.0,
-        value=0.0,
+        value=1.0,
         step=0.1,
         help="Percent of gross paid after target compensation is reached.",
     )
@@ -302,10 +328,12 @@ gross_sales = float(gross_sales)
 commission_rate = float(commission_rate)
 post_target_rate = float(post_target_rate)
 minimum_gross_sales = float(minimum_gross_sales)
+broker_commission = float(broker_commission)
 gross_at_target = gross_where_target_is_reached(
     base_salary, target_compensation, commission_rate, minimum_gross_sales
 )
-ceiling = 5000000  # axis_max(gross_sales, gross_at_target)
+
+ceiling = 3000000  # axis_max(gross_sales, gross_at_target)
 selected_pay = pay_at(
     gross_sales,
     base_salary,
@@ -332,9 +360,18 @@ curve = pd.DataFrame(
         )
     ]
 )
-compensation_curve = curve.assign(series="Total compensation")
+curve["broker_pay"] = [
+    broker_pay(gross, broker_commission, minimum_gross_sales, commission)
+    for gross, commission in zip(curve["gross"], curve["commission"], strict=True)
+]
+compensation_curve = curve.assign(
+    series="Total compensation", amount=curve["total_compensation"]
+)
+broker_curve = curve.assign(series="Broker pay", amount=curve["broker_pay"])
 rate_curve = curve.assign(series="Effective commission rate")
-chart_curve = pd.concat([compensation_curve, rate_curve], ignore_index=True)
+chart_curve = pd.concat(
+    [compensation_curve, broker_curve, rate_curve], ignore_index=True
+)
 selected = pd.DataFrame(
     [
         {**selected_pay, "series": "Total compensation"},
@@ -347,12 +384,23 @@ commission = float(selected_pay["commission"])
 effective_rate = float(selected_pay["effective_rate"])
 initial_commission = float(selected_pay["initial_commission"])
 post_commission = float(selected_pay["post_commission"])
+broker_net = broker_pay(gross_sales, broker_commission, minimum_gross_sales, commission)
 
-metric_total, metric_commission, metric_rate, metric_tier = st.columns(4)
-metric_total.metric("Total compensation", f"${total:,.0f}")
+metric_gross, metric_broker_net, metric_target = st.columns(3)
+metric_gross.metric("Gross sales", f"${gross_sales:,.0f}")
+metric_broker_net.metric("Broker Net", f"${broker_net:,.0f}")
+metric_target.metric("Target compensation", f"${target_compensation:,.0f}")
+
+metric_total, metric_commission, metric_rate = st.columns(3)
+metric_total.metric("Total compensation", f"${total:,.0f}", delta=(total - target_compensation))
 metric_commission.metric("Commission", f"${commission:,.0f}")
 metric_rate.metric("Effective commission rate", f"{effective_rate:.2f}%")
-metric_tier.metric("Tier at this gross", str(selected_pay["tier"]))
+
+
+
+
+
+
 
 if math.isfinite(gross_at_target):
     st.caption(
@@ -374,12 +422,18 @@ if math.isfinite(gross_at_target) and gross_at_target > ceiling:
     )
 
 st.caption(
-    "Bottom axis: gross sales. Left axis, solid line: total compensation. "
+    "Bottom axis: gross sales. Left axis, solid lines: total compensation and broker pay. "
     "Right axis, dashed line: effective commission rate, which is commission divided by gross. "
     "The pale guide is the minimum gross. The gray guide is where pay reaches the target. "
     "The green guide is the selected gross."
 )
-
+st.caption(
+    f"Broker net is {broker_commission}% of gross sales minus the minimum gross sales (expenses) and commission."
+)
+st.caption(
+    "Commission is 0% through the minimum gross. Gross above that earns the initial rate "
+    "until target compensation is reached, then the post-target rate."
+)
 st.altair_chart(
     build_chart(
         chart_curve,
@@ -389,5 +443,5 @@ st.altair_chart(
         target_compensation,
         minimum_gross_sales,
     ),
-    width="stretch",
+    width="stretch"
 )
