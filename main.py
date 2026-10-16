@@ -255,6 +255,7 @@ def build_chart(
         .resolve_scale(y="independent")
         .properties(
             height=460,
+            padding=alt.Padding(left=20, right=20),
             title="Total compensation, broker pay, and effective commission rate by gross sales",
         )
     )
